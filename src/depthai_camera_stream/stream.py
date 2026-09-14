@@ -1,4 +1,4 @@
-"""DepthAI camera stream abstraction with independent per-stream calibration."""
+"""DepthAI camera stream abstraction with independent full-rig calibration."""
 
 from __future__ import annotations
 
@@ -47,42 +47,69 @@ def _float_list(value: Any) -> Vector:
 
 @dataclass(frozen=True, slots=True)
 class CameraCalibrationResult:
-    """Normalized calibration for one DepthAI camera stream.
+    """Complete RGB + left + right calibration for one DepthAI device.
 
-    The result contains only plain Python values and is safe to cache,
-    serialize, and return through RPC/JSON boundaries.
+    Every CameraStream owns an independent CameraCalibration object, but every
+    object reads and returns the complete calibration of the physical camera rig.
+
+    The resolutions below are the resolutions stored in EEPROM calibration,
+    returned by CalibrationHandler.getDefaultIntrinsics().
     """
 
-    resolution: tuple[int, int]
-    intrinsics: Matrix
-    distortion: Vector
+    rgb_resolution: tuple[int, int]
+    left_resolution: tuple[int, int]
+    right_resolution: tuple[int, int]
+
+    rgb_intrinsics: Matrix
+    left_intrinsics: Matrix
+    right_intrinsics: Matrix
+
+    left_to_right_extrinsics: Matrix
+    left_to_rgb_extrinsics: Matrix
+
+    rgb_distortion: Vector
+    left_distortion: Vector
+    right_distortion: Vector
 
     distortion_coeff_order: tuple[str, ...] = DEPTHAI_DISTORTION_COEFF_NAMES
+    stereo_translation_units: str = "cm"
 
     board_name: str | None = None
     product_name: str | None = None
     device_id: str | None = None
-    fov_deg: float | None = None
+
+    stereo_baseline_cm: float | None = None
+
+    rgb_fov_deg: float | None = None
+    left_fov_deg: float | None = None
+    right_fov_deg: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a plain dictionary suitable for RPC/JSON serialization."""
+        """Return a plain mapping suitable for RPC/JSON serialization."""
         return asdict(self)
 
 
 @dataclass(kw_only=True, slots=True)
 class CameraCalibration:
-    """Calibration reader/cache for one camera stream.
+    """Independent complete calibration reader for one RGB-stereo DepthAI device.
 
-    Each CameraStream owns its own CameraCalibration instance. Nothing is
-    shared between RGB, left, and right streams.
+    This object is NOT shared between CameraStream objects.
 
-    EEPROM calibration is loaded lazily on the first calibration operation and
-    then cached inside this object.
+    Each instance independently:
+      1. obtains the DepthAI device,
+      2. reads EEPROM calibration once,
+      3. reads RGB + left + right calibration,
+      4. caches the complete CameraCalibrationResult.
+
+    No CameraStream registration and no calibration role are required.
     """
 
     pipeline: dai.Pipeline
-    socket: Any
-    size: tuple[int, int]
+
+    # Standard OAK RGB-stereo socket layout. Override if the hardware differs.
+    rgb_socket: Any = dai.CameraBoardSocket.CAM_A
+    left_socket: Any = dai.CameraBoardSocket.CAM_B
+    right_socket: Any = dai.CameraBoardSocket.CAM_C
 
     _device: Any = field(init=False, default=None, repr=False)
     _handler: Any = field(init=False, default=None, repr=False)
@@ -97,56 +124,47 @@ class CameraCalibration:
         repr=False,
     )
 
-    def __post_init__(self) -> None:
-        self._validate_size("size", self.size)
-
     @property
     def is_loaded(self) -> bool:
-        """Return whether EEPROM calibration has already been loaded."""
+        """Return whether this object has loaded EEPROM calibration."""
         with self._lock:
             return self._handler is not None
 
+    @property
+    def is_ready(self) -> bool:
+        """Return whether the complete calibration result is cached."""
+        with self._lock:
+            return self._data is not None
+
+    @property
+    def device(self) -> Any:
+        """Return the DepthAI device after calibration has been loaded."""
+        with self._lock:
+            self._load_once_locked()
+            return self._device
+
+    @property
+    def handler(self) -> Any:
+        """Return this object's cached DepthAI CalibrationHandler."""
+        with self._lock:
+            self._load_once_locked()
+            return self._handler
+
     def read_calibration(self) -> CameraCalibrationResult:
-        """Read and cache calibration for this camera."""
+        """Return complete RGB + left + right calibration.
+
+        The EEPROM is read only once by this CameraCalibration instance.
+        """
         with self._lock:
             if self._data is None:
                 self._load_once_locked()
-                self._data = self._build_result_locked()
+                self._data = self._build_calibration_result_locked()
 
             return self._data
 
     def read_calibration_dict(self) -> dict[str, Any]:
-        """Return this camera calibration as a plain dictionary."""
+        """Return complete calibration as a plain dictionary."""
         return self.read_calibration().to_dict()
-
-    def read_extrinsics(self, destination_socket: Any) -> Matrix:
-        """Return the transform from this camera to another camera socket."""
-        with self._lock:
-            self._load_once_locked()
-            return _float_matrix(
-                self._handler.getCameraExtrinsics(
-                    self.socket,
-                    destination_socket,
-                )
-            )
-
-    def read_baseline_cm(self, destination_socket: Any) -> float | None:
-        """Return baseline distance to another camera when supported."""
-        with self._lock:
-            self._load_once_locked()
-
-            if not hasattr(self._handler, "getBaselineDistance"):
-                return None
-
-            try:
-                return _safe_float(
-                    self._handler.getBaselineDistance(
-                        self.socket,
-                        destination_socket,
-                    )
-                )
-            except Exception:
-                return None
 
     def _load_once_locked(self) -> None:
         if self._handler is not None:
@@ -159,17 +177,34 @@ class CameraCalibration:
         self._device = device
         self._handler = device.readCalibration()
 
-    def _build_result_locked(self) -> CameraCalibrationResult:
+    def _build_calibration_result_locked(self) -> CameraCalibrationResult:
         if self._device is None or self._handler is None:
             raise RuntimeError("DepthAI calibration has not been loaded")
 
-        width, height = self.size
         calib = self._handler
+
+        rgb_intrinsics, rgb_resolution = self._read_default_intrinsics(
+            calib,
+            self.rgb_socket,
+        )
+        left_intrinsics, left_resolution = self._read_default_intrinsics(
+            calib,
+            self.left_socket,
+        )
+        right_intrinsics, right_resolution = self._read_default_intrinsics(
+            calib,
+            self.right_socket,
+        )
 
         board_name: str | None = None
         product_name: str | None = None
         device_id: str | None = None
-        fov_deg: float | None = None
+
+        stereo_baseline_cm: float | None = None
+
+        rgb_fov_deg: float | None = None
+        left_fov_deg: float | None = None
+        right_fov_deg: float | None = None
 
         try:
             eeprom = calib.getEepromData()
@@ -184,47 +219,122 @@ class CameraCalibration:
             pass
 
         try:
+            if hasattr(calib, "getBaselineDistance"):
+                stereo_baseline_cm = _safe_float(
+                    calib.getBaselineDistance(
+                        self.left_socket,
+                        self.right_socket,
+                    )
+                )
+        except Exception:
+            pass
+
+        try:
             if hasattr(calib, "getFov"):
-                fov_deg = _safe_float(calib.getFov(self.socket))
+                rgb_fov_deg = _safe_float(
+                    calib.getFov(self.rgb_socket)
+                )
+                left_fov_deg = _safe_float(
+                    calib.getFov(self.left_socket)
+                )
+                right_fov_deg = _safe_float(
+                    calib.getFov(self.right_socket)
+                )
         except Exception:
             pass
 
         return CameraCalibrationResult(
-            resolution=self.size,
-            intrinsics=_float_matrix(
-                calib.getCameraIntrinsics(
-                    self.socket,
-                    width,
-                    height,
-                )
+            rgb_resolution=rgb_resolution,
+            left_resolution=left_resolution,
+            right_resolution=right_resolution,
+            rgb_intrinsics=rgb_intrinsics,
+            left_intrinsics=left_intrinsics,
+            right_intrinsics=right_intrinsics,
+            left_to_right_extrinsics=self._read_extrinsics(
+                calib,
+                self.left_socket,
+                self.right_socket,
             ),
-            distortion=_float_list(
-                calib.getDistortionCoefficients(
-                    self.socket,
-                )
+            left_to_rgb_extrinsics=self._read_extrinsics(
+                calib,
+                self.left_socket,
+                self.rgb_socket,
+            ),
+            rgb_distortion=self._read_distortion(
+                calib,
+                self.rgb_socket,
+            ),
+            left_distortion=self._read_distortion(
+                calib,
+                self.left_socket,
+            ),
+            right_distortion=self._read_distortion(
+                calib,
+                self.right_socket,
             ),
             board_name=board_name,
             product_name=product_name,
             device_id=device_id,
-            fov_deg=fov_deg,
+            stereo_baseline_cm=stereo_baseline_cm,
+            rgb_fov_deg=rgb_fov_deg,
+            left_fov_deg=left_fov_deg,
+            right_fov_deg=right_fov_deg,
         )
 
     @staticmethod
-    def _validate_size(name: str, size: tuple[int, int]) -> None:
-        if len(size) != 2 or size[0] <= 0 or size[1] <= 0:
-            raise ValueError(
-                f"{name} must be a positive (width, height) tuple"
+    def _read_default_intrinsics(
+        calib: Any,
+        socket: Any,
+    ) -> tuple[Matrix, tuple[int, int]]:
+        """Read EEPROM intrinsics and their native calibration resolution."""
+        intrinsics, width, height = calib.getDefaultIntrinsics(socket)
+
+        return (
+            _float_matrix(intrinsics),
+            (int(width), int(height)),
+        )
+
+    @staticmethod
+    def _read_extrinsics(
+        calib: Any,
+        source_socket: Any,
+        destination_socket: Any,
+    ) -> Matrix:
+        return _float_matrix(
+            calib.getCameraExtrinsics(
+                source_socket,
+                destination_socket,
             )
+        )
+
+    @staticmethod
+    def _read_distortion(
+        calib: Any,
+        socket: Any,
+    ) -> Vector:
+        return _float_list(
+            calib.getDistortionCoefficients(socket)
+        )
 
 
 @dataclass(kw_only=True, slots=True)
 class CameraStream:
-    """Build one MJPEG camera stream and an optional thumbnail stream.
+    """Build one MJPEG camera stream and optional thumbnail stream.
 
-    Every CameraStream automatically owns an independent CameraCalibration
-    object configured for the same pipeline, socket, and output size.
+    Every CameraStream automatically creates its OWN CameraCalibration object.
 
-    No shared calibration object and no calibration role are required.
+    However, read_calibration() always returns the COMPLETE device calibration:
+      - RGB intrinsics / distortion / FOV
+      - left intrinsics / distortion / FOV
+      - right intrinsics / distortion / FOV
+      - left -> right extrinsics
+      - left -> RGB extrinsics
+      - stereo baseline
+      - EEPROM/device information
+
+    Therefore rgb.read_calibration(), left.read_calibration(), and
+    right.read_calibration() all return equivalent complete rig information,
+    while their CameraCalibration objects remain independent.
     """
 
     pipeline: dai.Pipeline
@@ -247,6 +357,11 @@ class CameraStream:
     thumbnail_mjpeg_quality: int = 70
     thumbnail_queue_size: int = 1
     thumbnail_queue_blocking: bool = False
+
+    # Full-rig calibration socket mapping.
+    calibration_rgb_socket: Any = dai.CameraBoardSocket.CAM_A
+    calibration_left_socket: Any = dai.CameraBoardSocket.CAM_B
+    calibration_right_socket: Any = dai.CameraBoardSocket.CAM_C
 
     calibration: CameraCalibration = field(
         init=False,
@@ -299,10 +414,14 @@ class CameraStream:
     def __post_init__(self) -> None:
         self._validate()
 
+        # IMPORTANT:
+        # Every CameraStream gets a NEW calibration object.
+        # Nothing is shared between rgb/left/right CameraStream instances.
         self.calibration = CameraCalibration(
             pipeline=self.pipeline,
-            socket=self.socket,
-            size=self.size,
+            rgb_socket=self.calibration_rgb_socket,
+            left_socket=self.calibration_left_socket,
+            right_socket=self.calibration_right_socket,
         )
 
     @property
@@ -316,15 +435,16 @@ class CameraStream:
         return self._built
 
     def build(self) -> CameraStream:
-        """Create the camera, encoders, and output queues."""
+        """Create camera, encoder, and output queues."""
         if self._built:
             raise RuntimeError(
                 f"CameraStream {self.name!r} has already been built"
             )
 
-        self.camera = self.pipeline.create(dai.node.Camera).build(
-            self.socket
-        )
+        self.camera = self.pipeline.create(
+            dai.node.Camera
+        ).build(self.socket)
+
         self._configure_camera()
 
         self.frame, self.encoder, self.queue = self._create_mjpeg_output(
@@ -370,23 +490,12 @@ class CameraStream:
         return self
 
     def read_calibration(self) -> CameraCalibrationResult:
-        """Return calibration for this camera stream."""
+        """Return COMPLETE RGB + left + right device calibration."""
         return self.calibration.read_calibration()
 
     def read_calibration_dict(self) -> dict[str, Any]:
-        """Return calibration for this stream as a plain dictionary."""
+        """Return COMPLETE device calibration as a plain dictionary."""
         return self.calibration.read_calibration_dict()
-
-    def read_extrinsics(self, destination_socket: Any) -> Matrix:
-        """Return transform from this camera to another camera socket."""
-        return self.calibration.read_extrinsics(destination_socket)
-
-    def read_baseline_cm(
-        self,
-        destination_socket: Any,
-    ) -> float | None:
-        """Return baseline distance to another camera when supported."""
-        return self.calibration.read_baseline_cm(destination_socket)
 
     def read_latest(
         self,
@@ -397,9 +506,9 @@ class CameraStream:
         """Return the newest host packet currently available.
 
         When block=True, wait for at least one packet with get(). Then drain
-        the queue with tryGet() so stale frames are discarded.
+        the queue with tryGet() and return only the newest packet.
 
-        When block=False, return None immediately if no packet is available.
+        When block=False, return None immediately when no packet is available.
         """
         if not self._built:
             raise RuntimeError(
@@ -444,9 +553,8 @@ class CameraStream:
         queue_size: int,
         queue_blocking: bool,
     ) -> tuple[Any, Any, Any]:
-        # Positional arguments are intentional here. DepthAI exposes this
-        # pybind11 API with camelCase keyword names, while this wrapper uses
-        # Python-style snake_case names.
+        # Positional arguments are intentional because DepthAI's pybind11 API
+        # uses camelCase keyword names.
         frame = self.camera.requestOutput(
             size,
             input_type,

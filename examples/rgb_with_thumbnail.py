@@ -50,7 +50,7 @@ def main() -> None:
     thumbnail_path = Path("thumbnail.jpg")
 
     try:
-        with dai.Pipeline() as pipeline:
+        with dai.Pipeline(dai.Device(dai.DeviceInfo("169.254.1.222"))) as pipeline:
             rgb = CameraStream(
                 pipeline=pipeline,
                 name="rgb",
@@ -68,6 +68,9 @@ def main() -> None:
                 thumbnail_queue_size=1,
                 thumbnail_queue_blocking=False,
             ).build()
+
+            rgb_calib = rgb.read_calibration_dict()
+            print(rgb_calib)
 
             pipeline.start()
             print("Pipeline started. Press q, Esc, or Ctrl+C to stop.")
