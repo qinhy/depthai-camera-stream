@@ -104,15 +104,17 @@ class CameraCalibration:
     No CameraStream registration and no calibration role are required.
     """
 
-    pipeline: dai.Pipeline
+    pipeline: dai.Pipeline | None
 
     # Standard OAK RGB-stereo socket layout. Override if the hardware differs.
     rgb_socket: Any = dai.CameraBoardSocket.CAM_A
     left_socket: Any = dai.CameraBoardSocket.CAM_B
     right_socket: Any = dai.CameraBoardSocket.CAM_C
 
-    _device: Any = field(init=False, default=None, repr=False)
-    _handler: Any = field(init=False, default=None, repr=False)
+    # IMPORTANT: do not keep a strong reference to dai.Device or
+    # CalibrationHandler here. The Pipeline owns the device lifecycle in
+    # DepthAI v3. Keeping those pybind handles alive can delay native device
+    # destruction/reconnect after the pipeline has been stopped.
     _data: CameraCalibrationResult | None = field(
         init=False,
         default=None,
@@ -126,9 +128,9 @@ class CameraCalibration:
 
     @property
     def is_loaded(self) -> bool:
-        """Return whether this object has loaded EEPROM calibration."""
+        """Return whether EEPROM calibration has been read and cached."""
         with self._lock:
-            return self._handler is not None
+            return self._data is not None
 
     @property
     def is_ready(self) -> bool:
@@ -136,29 +138,34 @@ class CameraCalibration:
         with self._lock:
             return self._data is not None
 
-    @property
-    def device(self) -> Any:
-        """Return the DepthAI device after calibration has been loaded."""
-        with self._lock:
-            self._load_once_locked()
-            return self._device
-
-    @property
-    def handler(self) -> Any:
-        """Return this object's cached DepthAI CalibrationHandler."""
-        with self._lock:
-            self._load_once_locked()
-            return self._handler
-
     def read_calibration(self) -> CameraCalibrationResult:
         """Return complete RGB + left + right calibration.
 
-        The EEPROM is read only once by this CameraCalibration instance.
+        The native Device and CalibrationHandler are deliberately kept only as
+        local variables while the EEPROM data is copied into immutable Python
+        values. This prevents CameraCalibration from extending the native
+        device lifetime.
         """
         with self._lock:
             if self._data is None:
-                self._load_once_locked()
-                self._data = self._build_calibration_result_locked()
+                pipeline = self.pipeline
+                if pipeline is None:
+                    raise RuntimeError(
+                        "CameraCalibration has been released before calibration was read"
+                    )
+
+                device = pipeline.getDefaultDevice()
+                if device is None:
+                    raise RuntimeError("DepthAI default device is not available")
+
+                calib = device.readCalibration()
+                self._data = self._build_calibration_result_locked(
+                    device=device,
+                    calib=calib,
+                )
+
+                # Do not assign device/calib to self. Their native handles are
+                # released as soon as this method returns.
 
             return self._data
 
@@ -166,22 +173,43 @@ class CameraCalibration:
         """Return complete calibration as a plain dictionary."""
         return self.read_calibration().to_dict()
 
-    def _load_once_locked(self) -> None:
-        if self._handler is not None:
-            return
+    def release(self, *, clear_cache: bool = False) -> None:
+        """Release calibration-side state without closing the shared device.
 
-        device = self.pipeline.getDefaultDevice()
-        if device is None:
-            raise RuntimeError("DepthAI default device is not available")
+        CameraCalibration does not own the DepthAI device. The containing
+        Pipeline owns that lifecycle, so this method never calls device.close().
+        """
+        with self._lock:
+            # Detach from Pipeline so a long-lived CameraCalibration object does
+            # not keep an old DepthAI device generation alive. Cached plain
+            # Python calibration values remain usable unless explicitly cleared.
+            self.pipeline = None
+            if clear_cache:
+                self._data = None
 
-        self._device = device
-        self._handler = device.readCalibration()
+    def __del__(self) -> None:
+        """Best-effort fallback that detaches this object from its Pipeline.
 
-    def _build_calibration_result_locked(self) -> CameraCalibrationResult:
-        if self._device is None or self._handler is None:
-            raise RuntimeError("DepthAI calibration has not been loaded")
+        ``__del__`` must never be the primary lifecycle mechanism: its timing is
+        controlled by Python's garbage collector and interpreter shutdown can
+        leave objects only partially available.  Explicit ``release()`` remains
+        preferred, but this prevents an abandoned CameraCalibration from keeping
+        an old Pipeline/device generation alive.
+        """
+        try:
+            self.release()
+        except BaseException:
+            # Exceptions escaping __del__ are ignored by Python but normally get
+            # printed to stderr.  Cleanup during GC/interpreter shutdown must be
+            # silent and best-effort.
+            pass
 
-        calib = self._handler
+    def _build_calibration_result_locked(
+        self,
+        *,
+        device: Any,
+        calib: Any,
+    ) -> CameraCalibrationResult:
 
         rgb_intrinsics, rgb_resolution = self._read_default_intrinsics(
             calib,
@@ -214,7 +242,7 @@ class CameraCalibration:
             pass
 
         try:
-            device_id = self._device.getDeviceInfo().getDeviceId()
+            device_id = device.getDeviceInfo().getDeviceId()
         except Exception:
             pass
 
@@ -337,7 +365,7 @@ class CameraStream:
     while their CameraCalibration objects remain independent.
     """
 
-    pipeline: dai.Pipeline
+    pipeline: dai.Pipeline | None
     name: str
     socket: Any
     size: tuple[int, int]
@@ -410,6 +438,16 @@ class CameraStream:
         default=False,
         repr=False,
     )
+    _closed: bool = field(
+        init=False,
+        default=False,
+        repr=False,
+    )
+    _lock: RLock = field(
+        init=False,
+        default_factory=RLock,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self._validate()
@@ -432,16 +470,34 @@ class CameraStream:
     @property
     def is_built(self) -> bool:
         """Return whether DepthAI nodes and queues have been created."""
-        return self._built
+        with self._lock:
+            return self._built
+
+    @property
+    def is_closed(self) -> bool:
+        """Return whether this stream has released its host-side handles."""
+        with self._lock:
+            return self._closed
 
     def build(self) -> CameraStream:
         """Create camera, encoder, and output queues."""
-        if self._built:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError(
+                    f"CameraStream {self.name!r} has already been closed"
+                )
+            if self._built:
+                raise RuntimeError(
+                    f"CameraStream {self.name!r} has already been built"
+                )
+
+        pipeline = self.pipeline
+        if pipeline is None:
             raise RuntimeError(
-                f"CameraStream {self.name!r} has already been built"
+                f"CameraStream {self.name!r} has no pipeline"
             )
 
-        self.camera = self.pipeline.create(
+        self.camera = pipeline.create(
             dai.node.Camera
         ).build(self.socket)
 
@@ -489,6 +545,55 @@ class CameraStream:
         self._built = True
         return self
 
+    def close(self) -> None:
+        """Release this stream's host-side DepthAI handles.
+
+        This method is intentionally *not* the owner of the shared Pipeline or
+        Device, so it never calls pipeline.stop() or device.close(). Stop the
+        shared pipeline once in the service/controller, then close every stream.
+        Calling close() multiple times is safe.
+        """
+        with self._lock:
+            if self._closed:
+                return
+
+            # Drop host queue references first, then node/output references.
+            # The Pipeline itself still owns the graph until it is stopped and
+            # released by the controller.
+            self.thumbnail_queue = None
+            self.queue = None
+
+            self.thumbnail_encoder = None
+            self.thumbnail_frame = None
+            self.encoder = None
+            self.frame = None
+            self.camera = None
+
+            self.calibration.release()
+
+            # This is the important final detach. A server may keep old
+            # CameraStream objects around for status/debugging; they must not
+            # keep the old Pipeline (and therefore the device) alive.
+            self.pipeline = None
+
+            self._built = False
+            self._closed = True
+
+    def __del__(self) -> None:
+        """Best-effort automatic cleanup when the stream object is collected.
+
+        The destructor intentionally delegates to ``close()`` only.  It does NOT
+        stop or close the shared Pipeline/Device because RGB/left/right streams
+        may all use the same Pipeline.  When the final owner releases that
+        Pipeline, DepthAI can tear down the device normally.
+        """
+        try:
+            self.close()
+        except BaseException:
+            # The object may be only partially initialized, or Python may be in
+            # interpreter shutdown.  Never allow a destructor exception to leak.
+            pass
+
     def read_calibration(self) -> CameraCalibrationResult:
         """Return COMPLETE RGB + left + right device calibration."""
         return self.calibration.read_calibration()
@@ -510,6 +615,10 @@ class CameraStream:
 
         When block=False, return None immediately when no packet is available.
         """
+        if self._closed:
+            raise RuntimeError(
+                f"CameraStream {self.name!r} has been closed"
+            )
         if not self._built:
             raise RuntimeError(
                 f"CameraStream {self.name!r} has not been built"
@@ -562,7 +671,13 @@ class CameraStream:
             fps,
         )
 
-        encoder = self.pipeline.create(
+        pipeline = self.pipeline
+        if pipeline is None:
+            raise RuntimeError(
+                f"CameraStream {self.name!r} has no pipeline"
+            )
+
+        encoder = pipeline.create(
             dai.node.VideoEncoder
         ).build(
             frame,
@@ -670,3 +785,30 @@ class CameraStream:
     ) -> None:
         if value <= 0:
             raise ValueError(f"{name} must be > 0")
+
+
+def shutdown_camera_pipeline(
+    pipeline: dai.Pipeline,
+    *streams: CameraStream,
+) -> None:
+    """Stop one shared DepthAI pipeline and release stream references.
+
+    DepthAI v3 makes Pipeline the lifecycle owner. Do not call device.close()
+    from individual CameraStream/CameraCalibration objects because several
+    streams can share the same default device.
+
+    For the strongest deterministic cleanup, create the pipeline with a
+    context manager (``with dai.Pipeline() as pipeline:``) and call this helper
+    from the ``finally`` block before leaving that context.
+    """
+    try:
+        is_running = getattr(pipeline, "isRunning", None)
+        if callable(is_running) and is_running():
+            pipeline.stop()
+
+        wait = getattr(pipeline, "wait", None)
+        if callable(wait):
+            wait()
+    finally:
+        for stream in streams:
+            stream.close()
