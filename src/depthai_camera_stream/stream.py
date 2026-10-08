@@ -100,8 +100,11 @@ class CameraCalibration:
             device = pipeline.getDefaultDevice()
             if device is None:
                 raise RuntimeError("DepthAI default device is not available")
-
-            data = self._build_calibration_result_locked(device=device, calib=device.readCalibration())
+            
+            # this sometime got wrong data
+            # data = self._build_calibration_result_locked(device=device, calib=device.readCalibration())
+            
+            data = self._build_calibration_result_locked(device=device, calib=device.readFactoryCalibration())
             self._data = data
             return data
 
