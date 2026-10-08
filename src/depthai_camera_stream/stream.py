@@ -88,7 +88,7 @@ class CameraCalibration:
     def is_ready(self) -> bool:
         return self.is_loaded
 
-    def read_calibration(self) -> CameraCalibrationResult:
+    def read_calibration(self,factory=True) -> CameraCalibrationResult:
         with self._lock:
             if self._data is not None:
                 return self._data
@@ -100,16 +100,17 @@ class CameraCalibration:
             device = pipeline.getDefaultDevice()
             if device is None:
                 raise RuntimeError("DepthAI default device is not available")
-            
-            # this sometime got wrong data
-            # data = self._build_calibration_result_locked(device=device, calib=device.readCalibration())
-            
-            data = self._build_calibration_result_locked(device=device, calib=device.readFactoryCalibration())
+
+            if not factory:
+                # this sometime got wrong data
+                data = self._build_calibration_result_locked(device=device, calib=device.readCalibration())
+            else:
+                data = self._build_calibration_result_locked(device=device, calib=device.readFactoryCalibration())
             self._data = data
             return data
 
-    def read_calibration_dict(self) -> dict[str, object]:
-        return self.read_calibration().to_dict()
+    def read_calibration_dict(self,factory=True) -> dict[str, object]:
+        return self.read_calibration(factory=factory).to_dict()
 
     def release(self, *, clear_cache: bool = False) -> None:
         with self._lock:
@@ -310,8 +311,8 @@ class CameraStream:
         with suppress(BaseException):
             self.close()
 
-    def read_calibration(self) -> CameraCalibrationResult:
-        return self.calibration.read_calibration()
+    def read_calibration(self,factory=True) -> CameraCalibrationResult:
+        return self.calibration.read_calibration(factory=factory)
 
     def read_calibration_dict(self) -> dict[str, object]:
         return self.calibration.read_calibration_dict()
